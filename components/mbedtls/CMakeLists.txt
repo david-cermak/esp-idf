@@ -39,10 +39,10 @@ if(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
     list(APPEND mbedtls_include_dirs "esp_crt_bundle/include")
 endif()
 
-idf_component_register(SRCS "${mbedtls_srcs}"
+idf_component_register(SRCS "${mbedtls_srcs}" mbedtls/library/ssl_hybrid_pqc.c
     INCLUDE_DIRS "${mbedtls_include_dirs}"
     PRIV_REQUIRES "${priv_requires}"
-    REQUIRES "${requires}"
+    REQUIRES ${requires} mlkem768_temp
     )
 
 # Determine the type of mbedtls component library
@@ -420,3 +420,5 @@ endif()
 if(CONFIG_ATCA_MBEDTLS_ECDSA)
     mbedcrypto_optional_deps(espressif__esp-cryptoauthlib esp-cryptoauthlib)
 endif()
+
+target_link_libraries(${COMPONENT_LIB} PRIVATE "-u mbedtls_ssl_tls13_generate_hybrid_x25519mlkem768_key_exchange")
