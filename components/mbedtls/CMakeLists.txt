@@ -59,14 +59,13 @@ if(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
     list(APPEND mbedtls_include_dirs "esp_crt_bundle/include")
 endif()
 
-
 list(APPEND mbedtls_include_dirs "${COMPONENT_DIR}/port/psa_driver/include")
 list(APPEND mbedtls_include_dirs "${COMPONENT_DIR}/port/psa_crypto_storage/include")
 
-idf_component_register(SRCS "${mbedtls_srcs}"
+idf_component_register(SRCS "${mbedtls_srcs}" mbedtls/library/ssl_hybrid_pqc.c
     INCLUDE_DIRS "${mbedtls_include_dirs}"
     PRIV_REQUIRES "${priv_requires}"
-    REQUIRES "${requires}"
+    REQUIRES ${requires} liboqs_mlkem
     )
 
 # Add MBEDTLS_MAJOR_VERSION definition to the component library
@@ -638,3 +637,5 @@ if(CONFIG_COMPILER_STATIC_ANALYZER AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
     endforeach()
     message(STATUS "All mbedtls-related global targets: ${mbedtls_global_targets}")
 endif()
+
+target_link_libraries(${COMPONENT_LIB} PRIVATE "-u mbedtls_ssl_tls13_generate_hybrid_x25519mlkem768_key_exchange")
