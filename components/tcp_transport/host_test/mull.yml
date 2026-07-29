@@ -1,0 +1,20 @@
+# Mull mutation-testing config for tcp_transport host tests (PoC).
+# Scope: websocket transport production source only.
+
+mutators:
+  - cxx_boundary
+  - cxx_comparison
+  - cxx_increment
+  - cxx_arithmetic
+
+includePaths:
+  - .*/components/tcp_transport/transport_ws\.c$
+
+excludePaths:
+  - .*/host_test/.*
+  - .*/tests/.*
+  - .*/mocks/.*
+  - .*/unity/.*
+  - .*/managed_components/.*
+
+quiet: true

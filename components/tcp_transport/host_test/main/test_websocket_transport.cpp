@@ -1,10 +1,11 @@
 /*
- * SPDX-FileCopyrightText: 2024-2025 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2024-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -199,6 +200,110 @@ int mock_valid_poll_read_fragmented_callback(esp_transport_handle_t t, int timeo
     return mock_valid_read_fragmented_callback(t, nullptr, 0, 0, 0);
 }
 
+std::string make_handshake_response(const char *status_line = "HTTP/1.1 101 Switching Protocols",
+                                    const char *accept_key = "HSmrc0sMlYUkAGmm5OPpG2HaGWk=",
+                                    const char *extra_headers = "")
+{
+    return fmt::format("{}\r\n"
+                       "Upgrade: websocket\r\n"
+                       "Connection: Upgrade\r\n"
+                       "Sec-WebSocket-Accept: {}\r\n"
+                       "{}"
+                       "\r\n",
+                       status_line, accept_key, extra_headers);
+}
+
+std::string make_ws_frame(uint8_t first_byte, const std::string &payload, bool masked = false)
+{
+    std::string frame;
+    frame.push_back(static_cast<char>(first_byte));
+    const size_t len = payload.size();
+    uint8_t mask_bit = masked ? 0x80 : 0x00;
+    if (len <= 125) {
+        frame.push_back(static_cast<char>(mask_bit | len));
+    } else if (len < 65536) {
+        frame.push_back(static_cast<char>(mask_bit | 126));
+        frame.push_back(static_cast<char>((len >> 8) & 0xFF));
+        frame.push_back(static_cast<char>(len & 0xFF));
+    } else {
+        frame.push_back(static_cast<char>(mask_bit | 127));
+        for (int i = 7; i >= 0; --i) {
+            frame.push_back(static_cast<char>((len >> (8 * i)) & 0xFF));
+        }
+    }
+    std::array<char, 4> mask_key = {0x11, 0x22, 0x33, 0x44};
+    if (masked) {
+        frame.append(mask_key.data(), mask_key.size());
+        for (size_t i = 0; i < payload.size(); ++i) {
+            frame.push_back(static_cast<char>(payload[i] ^ mask_key[i % 4]));
+        }
+    } else {
+        frame.append(payload);
+    }
+    return frame;
+}
+
+void install_parent_ignored_mocks()
+{
+    mock_destroy_IgnoreAndReturn(ESP_OK);
+    mock_close_IgnoreAndReturn(0);
+    mock_poll_write_IgnoreAndReturn(1);
+}
+
+struct CapturedWrites {
+    std::vector<std::string> chunks;
+};
+
+// Capture used by post-connect write stubs.
+CapturedWrites g_writes;
+
+int capture_all_writes(esp_transport_handle_t, const char *data, int len, int timeout_ms, int)
+{
+    REQUIRE(data != nullptr);
+    REQUIRE(len > 0);
+    REQUIRE(timeout_ms > 0);
+    g_writes.chunks.emplace_back(data, data + len);
+    return len;
+}
+
+struct ScriptedReads {
+    std::vector<std::string> chunks;
+    size_t index = 0;
+    size_t offset = 0;
+};
+
+ScriptedReads g_reads;
+
+int scripted_read_callback(esp_transport_handle_t, char *buffer, int len, int, int)
+{
+    if (g_reads.index >= g_reads.chunks.size()) {
+        return 0;
+    }
+    const auto &chunk = g_reads.chunks[g_reads.index];
+    const size_t remaining = chunk.size() - g_reads.offset;
+    if (remaining == 0) {
+        g_reads.index++;
+        g_reads.offset = 0;
+        if (g_reads.index >= g_reads.chunks.size()) {
+            return 0;
+        }
+        return scripted_read_callback(nullptr, buffer, len, 0, 0);
+    }
+    const int to_copy = static_cast<int>(std::min(remaining, static_cast<size_t>(len)));
+    std::memcpy(buffer, chunk.data() + g_reads.offset, to_copy);
+    g_reads.offset += static_cast<size_t>(to_copy);
+    if (g_reads.offset >= chunk.size()) {
+        g_reads.index++;
+        g_reads.offset = 0;
+    }
+    return to_copy;
+}
+
+int always_ready_poll_read(esp_transport_handle_t, int, int)
+{
+    return 1;
+}
+
 }
 
 TEST_CASE("WebSocket Transport Connection", "[success]")
@@ -206,6 +311,7 @@ TEST_CASE("WebSocket Transport Connection", "[success]")
     constexpr static auto timeout = 50;
     constexpr static auto port = 8080;
     constexpr static auto host = "localhost";
+    install_parent_ignored_mocks();
     // Initialize the parent handle
     unique_transport parent_handle{esp_transport_init(), esp_transport_destroy};
     REQUIRE(parent_handle);
@@ -353,6 +459,7 @@ TEST_CASE("WebSocket Transport Connection", "[failure]")
     constexpr static auto timeout = 50;
     constexpr static auto port = 8080;
     constexpr static auto host = "localhost";
+    install_parent_ignored_mocks();
     // Initialize the parent handle
     unique_transport parent_handle{esp_transport_init(), esp_transport_destroy};
     REQUIRE(parent_handle);
@@ -454,5 +561,275 @@ TEST_CASE("WebSocket Transport Connection", "[failure]")
 
         // Connect should now succeed even with small user buffer
         REQUIRE(esp_transport_connect(websocket_transport.get(), host, port, timeout) == 0);
+    }
+}
+
+TEST_CASE("WebSocket config, write, control frames and getters", "[ws][coverage]")
+{
+    constexpr auto timeout = 50;
+    constexpr auto port = 8080;
+    constexpr auto host = "localhost";
+    install_parent_ignored_mocks();
+
+    unique_transport parent_handle{esp_transport_init(), esp_transport_destroy};
+    REQUIRE(parent_handle);
+    esp_transport_set_func(parent_handle.get(), mock_connect, mock_read, mock_write, mock_close,
+                           mock_poll_read, mock_poll_write, mock_destroy);
+
+    unique_transport ws{esp_transport_ws_init(parent_handle.get()), esp_transport_destroy};
+    REQUIRE(ws);
+
+    auto connect_with_response = [&](const std::string &response) {
+        g_reads = {};
+        g_reads.chunks.push_back(response);
+        g_writes = {};
+        mock_write_Stub(capture_all_writes);
+        mock_read_Stub(scripted_read_callback);
+        mock_poll_read_Stub(always_ready_poll_read);
+        mock_connect_ExpectAndReturn(parent_handle.get(), host, port, timeout, ESP_OK);
+        REQUIRE(esp_transport_connect(ws.get(), host, port, timeout) == 0);
+        REQUIRE_FALSE(g_writes.chunks.empty());
+    };
+
+    SECTION("config headers appear in upgrade request") {
+        std::vector<std::string> hook_lines;
+        auto hook = [](void *ctx, const char *line, int line_len) {
+            auto *out = static_cast<std::vector<std::string> *>(ctx);
+            out->emplace_back(line, line + line_len);
+        };
+
+        esp_transport_ws_config_t cfg = {};
+        cfg.ws_path = "/chat";
+        cfg.sub_protocol = "mqtt";
+        cfg.user_agent = "host-test-agent";
+        cfg.headers = "X-Custom: 1\r\n";
+        cfg.auth = "Bearer token";
+        cfg.header_hook = hook;
+        cfg.header_user_context = &hook_lines;
+        REQUIRE(esp_transport_ws_set_config(ws.get(), &cfg) == ESP_OK);
+
+        // Also exercise public setters (strdup / replace paths)
+        esp_transport_ws_set_path(ws.get(), "/chat2");
+        REQUIRE(esp_transport_ws_set_subprotocol(ws.get(), "mqtt") == ESP_OK);
+        REQUIRE(esp_transport_ws_set_user_agent(ws.get(), "host-test-agent") == ESP_OK);
+        REQUIRE(esp_transport_ws_set_headers(ws.get(), "X-Custom: 1\r\n") == ESP_OK);
+        REQUIRE(esp_transport_ws_set_auth(ws.get(), "Bearer token") == ESP_OK);
+        REQUIRE(esp_transport_ws_set_header_hook(ws.get(), hook, &hook_lines) == ESP_OK);
+
+        connect_with_response(make_handshake_response());
+        const std::string &req = g_writes.chunks.front();
+        REQUIRE_THAT(req, Catch::Matchers::ContainsSubstring("GET /chat2 HTTP/1.1"));
+        REQUIRE_THAT(req, Catch::Matchers::ContainsSubstring("Sec-WebSocket-Protocol: mqtt"));
+        REQUIRE_THAT(req, Catch::Matchers::ContainsSubstring("User-Agent: host-test-agent"));
+        REQUIRE_THAT(req, Catch::Matchers::ContainsSubstring("Authorization: Bearer token"));
+        REQUIRE_THAT(req, Catch::Matchers::ContainsSubstring("X-Custom: 1"));
+        REQUIRE(esp_transport_ws_get_upgrade_request_status(ws.get()) == 101);
+        REQUIRE_FALSE(hook_lines.empty());
+    }
+
+    SECTION("binary write, ping write, send_raw and poll_write/close") {
+        connect_with_response(make_handshake_response());
+        g_writes = {};
+
+        std::string payload(200, 'A'); // exercises 16-bit length branch
+        REQUIRE(esp_transport_write(ws.get(), payload.data(), static_cast<int>(payload.size()), timeout) ==
+                static_cast<int>(payload.size()));
+        REQUIRE(g_writes.chunks.size() >= 2);
+        REQUIRE((static_cast<uint8_t>(g_writes.chunks[0][0]) & 0x0F) == 0x02); // BINARY
+        REQUIRE((static_cast<uint8_t>(g_writes.chunks[0][1]) & 0x7F) == 126);
+
+        g_writes = {};
+        REQUIRE(esp_transport_write(ws.get(), "", 0, timeout) == 0); // PING
+        REQUIRE_FALSE(g_writes.chunks.empty());
+        REQUIRE(static_cast<uint8_t>(g_writes.chunks[0][0]) == 0x89); // FIN|PING
+
+        g_writes = {};
+        const char text[] = "hi";
+        REQUIRE(esp_transport_ws_send_raw(ws.get(),
+                                         static_cast<ws_transport_opcodes_t>(WS_TRANSPORT_OPCODES_TEXT | WS_TRANSPORT_OPCODES_FIN),
+                                         text, 2, timeout) == 2);
+        REQUIRE_FALSE(g_writes.chunks.empty());
+        REQUIRE((static_cast<uint8_t>(g_writes.chunks[0][0]) & 0x0F) == 0x01);
+
+        REQUIRE(esp_transport_ws_send_raw(nullptr, WS_TRANSPORT_OPCODES_TEXT, text, 2, timeout) == ESP_ERR_INVALID_ARG);
+        REQUIRE(esp_transport_poll_write(ws.get(), timeout) == 1);
+        REQUIRE(esp_transport_close(ws.get()) == 0);
+        // Parent has no TLS socket; still covers the ws wrapper.
+        REQUIRE(esp_transport_ws_poll_connection_closed(ws.get(), timeout) == -1);
+    }
+
+    SECTION("read getters after data frame") {
+        auto response = make_handshake_response() + make_ws_frame(0x81, "Hi"); // FIN|TEXT
+        connect_with_response(response);
+
+        char buf[8] = {};
+        REQUIRE(esp_transport_read(ws.get(), buf, sizeof(buf), timeout) == 2);
+        REQUIRE(std::string(buf, 2) == "Hi");
+        REQUIRE(esp_transport_ws_get_fin_flag(ws.get()) == true);
+        REQUIRE(esp_transport_ws_get_read_opcode(ws.get()) == WS_TRANSPORT_OPCODES_TEXT);
+        REQUIRE(esp_transport_ws_get_read_payload_len(ws.get()) == 2);
+    }
+
+    SECTION("read 16-bit length data frame") {
+        std::string payload(200, 'B');
+        auto response = make_handshake_response() + make_ws_frame(0x82, payload); // FIN|BINARY
+        connect_with_response(response);
+        std::vector<char> buf(payload.size());
+        REQUIRE(esp_transport_read(ws.get(), buf.data(), static_cast<int>(buf.size()), timeout) ==
+                static_cast<int>(payload.size()));
+        REQUIRE(std::string(buf.begin(), buf.end()) == payload);
+        REQUIRE(esp_transport_ws_get_read_payload_len(ws.get()) == static_cast<int>(payload.size()));
+    }
+
+    SECTION("auto-handle PING with PONG reply") {
+        connect_with_response(make_handshake_response());
+        g_reads = {};
+        g_reads.chunks.push_back(make_ws_frame(0x89, "ping")); // FIN|PING
+        g_writes = {};
+        mock_read_Stub(scripted_read_callback);
+
+        char buf[16] = {};
+        // propagate_control_frames=false (default): handled internally, returns 0
+        REQUIRE(esp_transport_read(ws.get(), buf, sizeof(buf), timeout) == 0);
+        REQUIRE_FALSE(g_writes.chunks.empty());
+        REQUIRE(static_cast<uint8_t>(g_writes.chunks[0][0]) == 0x8A); // FIN|PONG
+    }
+
+    SECTION("auto-handle PONG") {
+        connect_with_response(make_handshake_response());
+        g_reads = {};
+        g_reads.chunks.push_back(make_ws_frame(0x8A, "")); // FIN|PONG
+        mock_read_Stub(scripted_read_callback);
+        char buf[8] = {};
+        REQUIRE(esp_transport_read(ws.get(), buf, sizeof(buf), timeout) == 0);
+    }
+
+    SECTION("auto-handle CLOSE echoes close frame") {
+        connect_with_response(make_handshake_response());
+        g_reads = {};
+        uint16_t code = htons(1000);
+        std::string payload(reinterpret_cast<char *>(&code), sizeof(code));
+        g_reads.chunks.push_back(make_ws_frame(0x88, payload)); // FIN|CLOSE
+        g_writes = {};
+        mock_read_Stub(scripted_read_callback);
+        char buf[16] = {};
+        // poll_connection_closed fails without a real socket -> -1, but CLOSE echo is sent
+        REQUIRE(esp_transport_read(ws.get(), buf, sizeof(buf), timeout) == -1);
+        REQUIRE_FALSE(g_writes.chunks.empty());
+        REQUIRE(static_cast<uint8_t>(g_writes.chunks[0][0]) == 0x88);
+    }
+
+    SECTION("propagate control frames to reader") {
+        esp_transport_ws_config_t cfg = {};
+        cfg.propagate_control_frames = true;
+        REQUIRE(esp_transport_ws_set_config(ws.get(), &cfg) == ESP_OK);
+
+        connect_with_response(make_handshake_response());
+        g_reads = {};
+        g_reads.chunks.push_back(make_ws_frame(0x89, "xyz")); // FIN|PING
+        mock_read_Stub(scripted_read_callback);
+
+        char buf[8] = {};
+        REQUIRE(esp_transport_read(ws.get(), buf, sizeof(buf), timeout) == 3);
+        REQUIRE(std::string(buf, 3) == "xyz");
+        REQUIRE(esp_transport_ws_get_read_opcode(ws.get()) == WS_TRANSPORT_OPCODES_PING);
+    }
+
+    SECTION("payload transport handle and get_socket wrappers") {
+        connect_with_response(make_handshake_response());
+        // Resets remaining bytes via payload-transport helper used by some clients
+        REQUIRE(esp_transport_get_payload_transport_handle(ws.get()) == parent_handle.get());
+        // Parent mock has no _get_socket -> -1, but covers ws_get_socket path
+        REQUIRE(esp_transport_get_socket(ws.get()) == -1);
+    }
+}
+
+TEST_CASE("WebSocket connect edge cases", "[ws][coverage][failure]")
+{
+    constexpr auto timeout = 50;
+    constexpr auto port = 8080;
+    constexpr auto host = "localhost";
+    install_parent_ignored_mocks();
+
+    unique_transport parent_handle{esp_transport_init(), esp_transport_destroy};
+    REQUIRE(parent_handle);
+    esp_transport_set_func(parent_handle.get(), mock_connect, mock_read, mock_write, mock_close,
+                           mock_poll_read, mock_poll_write, mock_destroy);
+    unique_transport ws{esp_transport_ws_init(parent_handle.get()), esp_transport_destroy};
+    REQUIRE(ws);
+
+    mock_write_Stub(capture_all_writes);
+    mock_poll_read_Stub(always_ready_poll_read);
+
+    SECTION("parent connect failure") {
+        mock_connect_ExpectAndReturn(parent_handle.get(), host, port, timeout, -1);
+        REQUIRE(esp_transport_connect(ws.get(), host, port, timeout) == -1);
+    }
+
+    SECTION("invalid accept key") {
+        g_reads = {};
+        g_reads.chunks.push_back(make_handshake_response("HTTP/1.1 101 Switching Protocols", "not-a-valid-key========"));
+        mock_read_Stub(scripted_read_callback);
+        mock_connect_ExpectAndReturn(parent_handle.get(), host, port, timeout, ESP_OK);
+        REQUIRE(esp_transport_connect(ws.get(), host, port, timeout) == -1);
+    }
+
+    SECTION("missing accept key") {
+        g_reads = {};
+        g_reads.chunks.push_back("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
+        mock_read_Stub(scripted_read_callback);
+        mock_connect_ExpectAndReturn(parent_handle.get(), host, port, timeout, ESP_OK);
+        REQUIRE(esp_transport_connect(ws.get(), host, port, timeout) == -1);
+    }
+
+    SECTION("duplicate accept key") {
+        g_reads = {};
+        g_reads.chunks.push_back(
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Sec-WebSocket-Accept: HSmrc0sMlYUkAGmm5OPpG2HaGWk=\r\n"
+            "Sec-WebSocket-Accept: HSmrc0sMlYUkAGmm5OPpG2HaGWk=\r\n"
+            "\r\n");
+        mock_read_Stub(scripted_read_callback);
+        mock_connect_ExpectAndReturn(parent_handle.get(), host, port, timeout, ESP_OK);
+        REQUIRE(esp_transport_connect(ws.get(), host, port, timeout) == -1);
+    }
+
+    SECTION("HTTP redirect with Location") {
+        g_reads = {};
+        g_reads.chunks.push_back(
+            "HTTP/1.1 302 Found\r\n"
+            "Location: wss://example.com/redirect\r\n"
+            "\r\n");
+        mock_read_Stub(scripted_read_callback);
+        mock_connect_ExpectAndReturn(parent_handle.get(), host, port, timeout, ESP_OK);
+        REQUIRE(esp_transport_connect(ws.get(), host, port, timeout) == 302);
+        REQUIRE(esp_transport_ws_get_upgrade_request_status(ws.get()) == 302);
+        REQUIRE(std::string(esp_transport_ws_get_redir_uri(ws.get())) == "wss://example.com/redirect");
+    }
+
+    SECTION("HTTP redirect without Location") {
+        g_reads = {};
+        g_reads.chunks.push_back("HTTP/1.1 301 Moved Permanently\r\n\r\n");
+        mock_read_Stub(scripted_read_callback);
+        mock_connect_ExpectAndReturn(parent_handle.get(), host, port, timeout, ESP_OK);
+        REQUIRE(esp_transport_connect(ws.get(), host, port, timeout) == -1);
+    }
+
+    SECTION("null ws init parent") {
+        REQUIRE(esp_transport_ws_init(nullptr) == nullptr);
+    }
+
+    SECTION("clearable setter NULLs") {
+        REQUIRE(esp_transport_ws_set_subprotocol(ws.get(), "x") == ESP_OK);
+        REQUIRE(esp_transport_ws_set_subprotocol(ws.get(), nullptr) == ESP_OK);
+        REQUIRE(esp_transport_ws_set_user_agent(ws.get(), "y") == ESP_OK);
+        REQUIRE(esp_transport_ws_set_user_agent(ws.get(), nullptr) == ESP_OK);
+        REQUIRE(esp_transport_ws_set_headers(ws.get(), "H: 1\r\n") == ESP_OK);
+        REQUIRE(esp_transport_ws_set_headers(ws.get(), nullptr) == ESP_OK);
+        REQUIRE(esp_transport_ws_set_auth(ws.get(), "a") == ESP_OK);
+        REQUIRE(esp_transport_ws_set_auth(ws.get(), nullptr) == ESP_OK);
+        REQUIRE(esp_transport_ws_set_subprotocol(nullptr, "x") == ESP_ERR_INVALID_ARG);
+        REQUIRE(esp_transport_ws_set_header_hook(nullptr, nullptr, nullptr) == ESP_ERR_INVALID_ARG);
+        REQUIRE(esp_transport_ws_get_redir_uri(nullptr) == nullptr);
     }
 }
