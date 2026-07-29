@@ -658,6 +658,23 @@ TEST_CASE("WebSocket config, write, control frames and getters", "[ws][coverage]
         REQUIRE(esp_transport_ws_poll_connection_closed(ws.get(), timeout) == -1);
     }
 
+    SECTION("write length boundary 125 uses short header (kills Mull cxx_le_to_lt @422)") {
+        // transport_ws.c:_ws_write uses `if (len <= 125)` for the 7-bit length form.
+        // Mull survivor cxx_le_to_lt turns that into `len < 125`, so len==125 wrongly
+        // takes the 16-bit (126) path. Assert the short form at the boundary.
+        connect_with_response(make_handshake_response());
+        g_writes = {};
+
+        std::string payload(125, 'Z');
+        REQUIRE(esp_transport_write(ws.get(), payload.data(), static_cast<int>(payload.size()), timeout) == 125);
+        REQUIRE(g_writes.chunks.size() >= 2);
+        const auto &hdr = g_writes.chunks[0];
+        REQUIRE(hdr.size() == 6); // 2-byte header + 4-byte mask (not 4+4 extended)
+        REQUIRE((static_cast<uint8_t>(hdr[0]) & 0x0F) == 0x02);      // BINARY
+        REQUIRE((static_cast<uint8_t>(hdr[1]) & 0x7F) == 125);       // short length, not 126
+        REQUIRE(g_writes.chunks[1].size() == 125);
+    }
+
     SECTION("read getters after data frame") {
         auto response = make_handshake_response() + make_ws_frame(0x81, "Hi"); // FIN|TEXT
         connect_with_response(response);

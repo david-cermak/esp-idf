@@ -41,6 +41,9 @@ fi
 
 cd "${ROOT}"
 
+# Do not inherit gcov flags from a prior coverage session in this shell.
+unset EXTRA_CFLAGS EXTRA_CXXFLAGS EXTRA_CPPFLAGS || true
+
 # Baseline gcc build (no global Mull plugin — that breaks mbedtls under clang).
 if [[ ! -x "${BUILD_DIR}/host_tcp_transport_test.elf" ]]; then
     idf.py --preview -B "${BUILD_DIR}" set-target linux
@@ -98,6 +101,10 @@ export MULL_CONFIG="${ROOT}/mull.yml"
 REPORT_DIR="${ROOT}/mull_reports"
 mkdir -p "${REPORT_DIR}"
 REPORT_NAME="tcp_transport_ws"
+
+# Fresh report each run (sqlite reporter appends otherwise).
+rm -f "${REPORT_DIR}/${REPORT_NAME}.sqlite" \
+      "${REPORT_DIR}/${REPORT_NAME}_survivors.txt"
 
 REPORTERS=(--reporters SQLite)
 if [[ "${MULL_CONSOLE:-0}" == "1" ]]; then
