@@ -45,18 +45,24 @@ if(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
     list(APPEND mbedtls_include_dirs "esp_crt_bundle/include")
 endif()
 
-
 list(APPEND mbedtls_include_dirs "${COMPONENT_DIR}/port/psa_driver/include")
 
-idf_component_register(SRCS "${mbedtls_srcs}"
+idf_component_register(SRCS "${mbedtls_srcs}" mbedtls/library/ssl_hybrid_pqc.c
     INCLUDE_DIRS "${mbedtls_include_dirs}"
     PRIV_REQUIRES "${priv_requires}"
-    REQUIRES "${requires}"
+    REQUIRES ${requires} liboqs_mlkem
     )
 
 # Add MBEDTLS_MAJOR_VERSION definition to the component library
 target_compile_definitions(${COMPONENT_LIB} INTERFACE MBEDTLS_MAJOR_VERSION=4)
 target_compile_definitions(${COMPONENT_LIB} INTERFACE __STDC_WANT_LIB_EXT1__=0)
+
+# This component overrides the bundled 'mbedtls' component, so it must also
+# provide the idf::mbedtls alias target. Other IDF components (e.g. nvs_flash)
+# reference it directly by that name.
+if(NOT TARGET idf::mbedtls)
+    add_library(idf::mbedtls ALIAS ${COMPONENT_LIB})
+endif()
 
 # Set the type of mbedtls component library
 set(linkage_type PUBLIC)
@@ -618,3 +624,5 @@ if(CONFIG_COMPILER_STATIC_ANALYZER AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
     endforeach()
     message(STATUS "All mbedtls-related global targets: ${mbedtls_global_targets}")
 endif()
+
+target_link_libraries(${COMPONENT_LIB} PRIVATE "-u mbedtls_ssl_tls13_generate_hybrid_x25519mlkem768_key_exchange")

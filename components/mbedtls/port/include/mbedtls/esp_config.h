@@ -1246,6 +1246,16 @@
 #endif
 
 /**
+ * \def UPQC_ENABLE_HYBRID_11EC
+ *
+ * Enable hybrid X25519MLKEM768 support for TLS 1.3.
+ * This enables the X25519MLKEM768 hybrid group (0x11EC) in TLS 1.3.
+ */
+#ifdef CONFIG_MBEDTLS_UPQC_ENABLE_HYBRID_11EC
+#define UPQC_ENABLE_HYBRID_11EC
+#endif
+
+/**
  * \def MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE
  *
  * Enable TLS 1.3 middlebox compatibility mode.

@@ -1,0 +1,7 @@
+version: "0.1.1"
+url: https://github.com/david-cermak/upqc-lab/components/mbedtls
+description: The component provides patched mbedtls with X25519MLKEM768 hybrid KEX support
+dependencies:
+  idf: '>=6.0'
+  david-cermak/liboqs_mlkem:
+    version: "*"
