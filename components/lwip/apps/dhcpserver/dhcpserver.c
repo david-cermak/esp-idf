@@ -1283,6 +1283,12 @@ POOL_CHECK:
             return 4;
         }
 
+#if CONFIG_LWIP_DHCPS_REPORT_CLIENT_HOSTNAME
+        /* Option 12 belongs to this message. The lease updated below is the
+         * one found or created for this client's MAC. */
+        dhcps->opt_hostname_present = false;
+        dhcps->opt_hostname[0] = '\0';
+#endif
         s16_t ret = parse_options(dhcps, &m->options[4], len);
 
         if (ret == DHCPS_STATE_RELEASE || ret == DHCPS_STATE_NAK || ret ==  DHCPS_STATE_DECLINE) {
@@ -1834,6 +1840,92 @@ u8_t dhcps_test_parse_options(u8_t *optptr, s16_t len)
     mem_free(dhcps);
     return result;
 }
+
+#if CONFIG_LWIP_DHCPS_REPORT_CLIENT_HOSTNAME
+static void dhcps_test_free_leases(dhcps_t *dhcps)
+{
+    list_node *pnode = dhcps->plist;
+    while (pnode != NULL) {
+        list_node *pnext = pnode->pnext;
+        node_remove_from_list(&dhcps->plist, pnode);
+        mem_free(pnode->pnode);
+        mem_free(pnode);
+        pnode = pnext;
+    }
+}
+
+/**
+ * Reproduce SoftAP hostname leakage: client A joins with Option 12, then
+ * client B joins without Option 12. Returns true only if A's hostname stays
+ * on A's lease and B's lease hostname remains empty.
+ */
+bool dhcps_test_client_hostname_isolation(void)
+{
+    dhcps_t *dhcps = dhcps_new();
+    if (dhcps == NULL) {
+        return false;
+    }
+
+    IP4_ADDR(&dhcps->dhcps_poll.start_ip, 192, 168, 4, 2);
+    IP4_ADDR(&dhcps->dhcps_poll.end_ip, 192, 168, 4, 10);
+    dhcps->dhcps_poll.enable = true;
+    dhcps->client_address_plus.addr = dhcps->dhcps_poll.start_ip.addr;
+
+    const u8_t mac1[6] = {0x26, 0x77, 0x75, 0x6e, 0x30, 0x85};
+    const u8_t mac2[6] = {0xb4, 0xe6, 0x2d, 0xeb, 0x03, 0x95};
+    const char *hostname1 = "Redmi-K70";
+    const size_t hostname1_len = strlen(hostname1);
+
+    struct dhcps_msg msg;
+    memset(&msg, 0, sizeof(msg));
+    memcpy(msg.options, &magic_cookie, sizeof(magic_cookie));
+    memcpy(msg.chaddr, mac1, sizeof(mac1));
+
+    u8_t *opt = &msg.options[4];
+    *opt++ = DHCP_OPTION_MSG_TYPE;
+    *opt++ = 1;
+    *opt++ = DHCPDISCOVER;
+    *opt++ = DHCP_OPTION_HOST_NAME;
+    *opt++ = (u8_t)hostname1_len;
+    memcpy(opt, hostname1, hostname1_len);
+    opt += hostname1_len;
+    *opt++ = DHCP_OPTION_END;
+
+    if (parse_msg(dhcps, &msg, (u16_t)(opt - msg.options)) != DHCPS_STATE_OFFER) {
+        dhcps_test_free_leases(dhcps);
+        mem_free(dhcps);
+        return false;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    memcpy(msg.options, &magic_cookie, sizeof(magic_cookie));
+    memcpy(msg.chaddr, mac2, sizeof(mac2));
+
+    opt = &msg.options[4];
+    *opt++ = DHCP_OPTION_MSG_TYPE;
+    *opt++ = 1;
+    *opt++ = DHCPDISCOVER;
+    *opt++ = DHCP_OPTION_END;
+
+    if (parse_msg(dhcps, &msg, (u16_t)(opt - msg.options)) != DHCPS_STATE_OFFER) {
+        dhcps_test_free_leases(dhcps);
+        mem_free(dhcps);
+        return false;
+    }
+
+    char out1[CONFIG_LWIP_DHCPS_MAX_HOSTNAME_LEN];
+    char out2[CONFIG_LWIP_DHCPS_MAX_HOSTNAME_LEN];
+    bool found1 = dhcps_get_hostname_on_mac(dhcps, mac1, out1, sizeof(out1));
+    bool found2 = dhcps_get_hostname_on_mac(dhcps, mac2, out2, sizeof(out2));
+    bool pass = found1 && found2
+                && (strcmp(out1, hostname1) == 0)
+                && (out2[0] == '\0');
+
+    dhcps_test_free_leases(dhcps);
+    mem_free(dhcps);
+    return pass;
+}
+#endif /* CONFIG_LWIP_DHCPS_REPORT_CLIENT_HOSTNAME */
 #endif /* LWIP_DHCPS_TEST_PARSE_OPTIONS == 1 */
 
 #endif // ESP_DHCPS

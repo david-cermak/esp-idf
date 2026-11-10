@@ -610,6 +610,16 @@ TEST(lwip, dhcps_parse_options_req_ipaddr_truncated)
     TEST_ASSERT(state != 0);
 }
 
+#if CONFIG_LWIP_DHCPS_REPORT_CLIENT_HOSTNAME
+extern bool dhcps_test_client_hostname_isolation(void);
+
+TEST(lwip, dhcps_client_hostname_isolation)
+{
+    /* Client A sends Option 12, then client B omits it. B must not inherit A's name. */
+    TEST_ASSERT_TRUE(dhcps_test_client_hostname_isolation());
+}
+#endif /* CONFIG_LWIP_DHCPS_REPORT_CLIENT_HOSTNAME */
+
 #endif /* LWIP_DHCPS_TEST_PARSE_OPTIONS */
 
 TEST_GROUP_RUNNER(lwip)
@@ -633,6 +643,9 @@ TEST_GROUP_RUNNER(lwip)
     RUN_TEST_CASE(lwip, dhcps_parse_options_only_pads)
     RUN_TEST_CASE(lwip, dhcps_parse_options_unknown_option_skipped)
     RUN_TEST_CASE(lwip, dhcps_parse_options_req_ipaddr_truncated)
+#if CONFIG_LWIP_DHCPS_REPORT_CLIENT_HOSTNAME
+    RUN_TEST_CASE(lwip, dhcps_client_hostname_isolation)
+#endif
 #endif
 }
 
